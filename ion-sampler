@@ -1,8 +1,8 @@
-#!/usr/bin/python2.4 -OO
+#!/usr/bin/python -OO
 # -*- python -*-
 
 """
-   Copyright (C) 2006 Daniel Stutzbach
+   Copyright (C) 2006-2009 Daniel Stutzbach
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -656,8 +656,12 @@ bootstrap_data = [line.strip() for line in open(bootstrap, 'r').readlines()]
 def need_more_bootstrapping():
     queue_lock.acquire()
     try:
-        for addr in random.sample(bootstrap_data, 100):
-            heapq.heappush(queue, (random.random(), addr))
+        if len(bootstrap_data) > 100:
+            for addr in random.sample(bootstrap_data, 100):
+                heapq.heappush(queue, (random.random(), addr))
+        else:
+            for addr in bootstrap_data:
+                heapq.heappush(queue, (random.random(), addr))
     finally:
         queue_lock.release()
 
@@ -678,7 +682,7 @@ def do_print():
     host_lock.acquire()
     try:
         #print >>sys.stderr, 'Live: %d/%d, Queue: %d, Total Queued: %d, Active: %d, Completions: %d, Speed: %d' % (len(hosts)-len(stop_now), len(hosts), len(queue), len(queue) + sum(host_q.values()), sum(host_a.values()), completions, completions / delta), num_walks, any_len
-        #sys.stdout.flush()
+        #sys.stderr.flush()
         pass
 
     finally:
