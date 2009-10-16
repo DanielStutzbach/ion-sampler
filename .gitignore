@@ -1,0 +1,4 @@
+gnutella
+*.o
+*~
+.backup
