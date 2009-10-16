@@ -1,7 +1,7 @@
 /*
    gnutella.c: A Gnutella Ultrapeer plug-in for ion-sampler
 
-   Copyright (C) 2006 Daniel Stutzbach
+   Copyright (C) 2006-2009 Daniel Stutzbach
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -78,8 +78,8 @@ void init(void)
 
         if (0 > clock_getres(CLOCK_MONOTONIC, &timespec)) die();
 
-        /* 1 ms resolution should be _plenty_ */
-        if (timespec.tv_nsec / 1000000 < 1) die();
+        /* 5 ms resolution should be _plenty_ */
+        if (timespec.tv_sec || timespec.tv_nsec > 5000000) die();
 
         start_time = 0;
         start_time = get_now();
