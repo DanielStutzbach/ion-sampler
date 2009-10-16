@@ -1,0 +1,119 @@
+Copyright (C) 2006 Daniel Stutzbach
+
+README for ion-sampler 1.0
+
+ion-sampler is a tool for selecting peers approximately uniformly at
+random from the active peers in a peer-to-peer network.  The tool's
+algorithm is described in detail in the paper:
+
+    Daniel Stutzbach, Reza Rejaie, Nick Duffield, Subhabrata Sen,
+    Walter Willinger, ``On Unbiased Sampling for Unstructured
+    Peer-to-Peer Networks'', Internet Measurement Conference, October,
+    2006.
+
+    http://www.barsoom.org/~agthorr/papers/imc-2006-sampling.pdf
+
+Reading the paper before using the tool is highly recommended.
+
+The tool is intended for research use.  It depends on protocol hooks
+generously provided by P2P network developers.  If the tool is abused,
+it is likely these hooks will be removed.  Use with care.
+
+------------------------------------------------------------------------
+
+Requirements:
+
+1. A recent version of gcc
+2. GNU make
+3. A real-time library (librt) with the clock_gettime() and
+   clock_getres() functions.
+4. Python 2.4
+
+Tested on Red Hat Linux.  Porting to other Linux systems should be a
+piece of cake.  Porting to non-Linux systems shouldn't be too hard
+either, as long as they have gcc and Python.
+
+The use of the real-time library is to avoid problems with clocks
+running backwards.  Ordinary time-related system calls simply return
+the current wall time, which might change and might even change often
+(such as on systems running NTP).  Clocks running backward can wreck
+havoc when trying to keep accurate timers for timing out network
+traffic, so we use functions from the real-time library that provide
+clocks that measure elapsed time.
+
+------------------------------------------------------------------------
+
+Build instructions:
+
+Run "make"
+
+------------------------------------------------------------------------
+
+Execution instructions:
+
+"./ion-sampler gnutella -n 50" will select 50 ultrapeers from the
+Gnutella network and print out their IP:port pairs on standard output.
+ 
+Adding the -d option will print out the degree (how many neighbors)
+the selected ultrapeers have.
+
+ion-sampler typically takes a few minutes to run.  Don't be alarmed
+that it doesn't output anything immediately.
+
+------------------------------------------------------------------------
+
+Hacking:
+
+ion-sampler is really two programs.  One of them is called "gnutella"
+and deals with the protocol details of asking a Gnutella peer for a
+list of its neighbors.  The other program is called "ion-sampler" and
+performs the random walk to select peers uniformly at random.  The
+mandatory argument "gnutella" to ion-sampler tells it run the
+"gnutella" program and use "gnutella.in" as an initial source of
+addresses.
+
+ion-sampler can be extended to other peer-to-peer networks by writing
+an appropriate program, similar to the provided "gnutella" program.
+Hereinafter, such programs are called "plug-ins".
+
+The plug-in reads addresses from standard input.  Each address is
+separated by a newline character ('\n').  The plug-in must contact
+that address via the network and either discover the peer's neighbors'
+addresses or fail (due to a connection refused, timeout, etc).  
+
+When the plug-in retrieves the list of neighbors, it must print out a
+line in the following format:
+
+R: IP:port(optional) peertype neighbors, leafs
+
+where:
+
+IP:port -> the peer's IP address and port, as earlier read from stdin
+optional -> any extra data you need for debugging
+peertype -> "Ultrapeer" or "Leaf"
+neighbors -> a space separated list of IP:port pairs
+leafs -> a space separated list of IP:port pairs
+
+This format is regrettably a little Gnutella-specific.  In the future,
+a more flexible system may be used.
+
+In the even of a failure, the output format is:
+
+R: IP:port() failure message
+
+The failure message may be any string as long as it does not start
+with the words "Ultrapeer", "Leaf", or "Peer".  The plug-in *must*
+output either a list of neighbors or an error for every address read
+from standard input.  If it loses track of an address or waits
+indefinitely for a response, ion-sampler will also wait indefinitely. 
+
+For correct operation, the plug-in must continue to read addresses
+from standard input even while processing earlier addresses.  In other
+words, the program must multiplex.  It cannot just read one address,
+get data from the network, print out the results, then read the next
+address.
+
+------------------------------------------------------------------------
+
+Please send all questions, comments, or patches to:
+    "Daniel Stutzbach" <agthorr@barsoom.org>

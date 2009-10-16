@@ -1,0 +1,731 @@
+#!/usr/bin/python2.4 -OO
+# -*- python -*-
+
+"""
+   Copyright (C) 2006 Daniel Stutzbach
+
+   This program is free software; you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation; either version 2 of the License, or
+   (at your option) any later version.
+   
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+   
+   You should have received a copy of the GNU General Public License
+   along with this program; if not, write to the Free Software
+   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+"""
+
+import thread, heapq, random, time, os, sys, datetime, signal, popen2, bz2, re
+import os.path
+from optparse import OptionParser
+#import mail
+from subprocess import *
+from itertools import chain
+import traceback
+
+re_gnut_line = re.compile(r' ?([0-9\.:]+)(?:\(\|?([^\|]*)\|?\d*\))?: ([A-Za-z ]+)(.*)')
+
+def routable(ip):
+    octets = [int(x) for x in ip.split('.')]
+    if len(octets) != 4: return False
+    if tuple(octets[0:2]) == (192,168): return False
+    if octets[0] == 10: return False
+    if octets[0] == 0: return False
+    if tuple(octets[0:2]) == (169.254): return False
+    if octets[0] == 172 and (octets[1] >= 16 or octets[1] <= 31): return False
+    if octets[0] == 127: return False
+    return True
+
+def good_addr(addr):
+    try:
+        ip, port = addr.split(':')
+        if not routable(ip): return False
+        port = int(port)
+    except:
+        return False
+    return True
+
+def memoize(f):
+    def g(*args):
+        if args not in g.cache:
+            if len(g.cache) > 100000:
+                for k in random.sample(g.cache.iterkeys(), 10000):
+                    del g.cache[k]
+            g.cache[args] = f(*args)
+        return g.cache[args]
+    g.cache = {}
+    return g
+
+sleep_times = 0.0001
+
+host_pops = {}
+bad_hosts = set()
+completions = 0
+queue = []
+all_walks_lock = thread.allocate_lock()
+queue_lock = thread.allocate_lock()
+host_lock = thread.allocate_lock()
+output_lock = thread.allocate_lock()
+done = False
+countdown = -1
+queue_size = 1000
+
+re_lines = { 'gnutella': re_gnut_line}
+
+hosts = ('localhost',
+         )
+
+usage = "%prog gnutella [options]"
+
+parser = OptionParser(usage=usage)
+parser.add_option("--hops", type="int", default=25)
+parser.add_option('-n', "--numwalks", type="int", default=10)
+parser.add_option('--version', action="store_true", default=False)
+parser.add_option('-d', "--show-degree", action="store_true", default=False, dest="show_degree")
+options, args = parser.parse_args()
+
+if options.version:
+    print """ion-sampler 1.0
+Copyright (C) 2006 Daniel Stutzbach
+This is free software.  You may redistribute copies of it under the terms of
+the GNU General Public License <http://www.gnu.org/licenses/gpl.html>.
+There is NO WARRANTY, to the extent permitted by law.
+"""
+    sys.exit(0)
+
+if len(args) > 1:
+    parser.error('Too many arguments')
+
+if len(args) == 0:
+    parser.error('Too few arguments')
+
+if args[0] != 'gnutella':
+    print 'Currently only the Gnutella P2P network is supported'
+    exit(-1)
+
+path = './' + args[0]
+re_line = re_lines[args[0]]
+bootstrap = '%s.in' % args[0]
+show_degree = options.show_degree
+
+num_walks = options.numwalks
+hop_budget = options.hops
+
+if num_walks > 1000:
+    print """ion-sampler does not support gathering more than 1,000 samples
+             at a time.  Gathering too many samples at a time can burden
+             the target peer-to-peer (P2P) network.  If this occurs, the
+             P2P network developers may remove the features that ion-sampler
+             needs to work.  Sorry.
+             """
+    sys.exit(-1)
+
+if hop_budget > 100:
+    print """ion-sampler does not support walks with a length greater than 100
+             hops.  Very long walks can burden the target peer-to-peer
+             (P2P) network.  If this occurs, the P2P network
+             developers may remove the features that ion-sampler needs
+             to work.  Sorry.
+             """
+    sys.exit(-1)
+
+host_q = {}
+host_a = {}
+
+sanity_lock = thread.allocate_lock()
+insanity = False
+def sanity():
+    return
+    global insanity
+    if insanity: return
+    sanity_lock.acquire()
+    Walk.pending_lock.acquire()
+    try:
+        queue_lock.acquire()
+        host_lock.acquire()
+        try:
+            all = sum(Walk.pending.itervalues(), [])
+            all_walks_lock.acquire()
+            try:
+                if random.random() < 0.001:
+                    print >>sys.stderr, len(set(all)), len(set(all_walks)), \
+                          len(set(queue + sum((list(hq) for hq in host_queues.itervalues()),[]))), len(Walk.pending), len(queue)
+                assert set(all) == set(all_walks)
+            finally:
+                all_walks_lock.release()
+            
+            for addr in Walk.pending:
+                if addr == 'any': continue
+                if addr in [x[1] for x in queue]:
+                    continue
+                for host in host_locks:
+                    host_locks[host].acquire()
+                    try:
+                        if addr in host_queues[host]:
+                            break
+                    finally:
+                        host_locks[host].release()
+                else:
+                    insanity = True
+                    print 'EEEEEEEEEEEEEEEKKKKKK', addr, host_queues, queue
+                    raise addr, 'not found!!!'
+        finally:
+            host_lock.release()
+            queue_lock.release()
+    finally:
+        Walk.pending_lock.release()
+        sanity_lock.release()
+
+def get_now():
+    now = datetime.datetime.now()
+    return now.isoformat(sep='T')
+start = datetime.datetime.now()
+
+def mean(seq):
+    return sum(seq) / float(len(seq))
+
+def host_died(host):
+    txt = ''
+    txt = ''
+    line = 'x'
+    while line:
+        try:
+            line = host_pops[host].stdout.readline()
+        except IOError:
+            line = ''
+        except ValueError:
+            line = ''
+        if line and line[1] == ':': break
+        txt = txt + line
+        print line,
+    #mail.mail_me(txt, '%s failed' % host)
+
+    host_lock.acquire()
+    host_locks[host].acquire()
+    try:
+        q = host_queues[host]
+        host_queues[host] = set()
+    finally:
+        host_locks[host].release()
+        host_lock.release()
+        
+    host_lock.acquire()
+    try:
+        stop_now.add(host)
+        host_q[host] = 0
+    finally:
+        host_lock.release()
+        
+    queue_lock.acquire()
+    try:
+        for addr in q:
+            heapq.heappush(queue, (random.random(), addr))
+    finally:
+        queue_lock.release()
+
+def stop(host, f, msg):
+    print host, msg
+    print >>sys.stderr, host, msg
+    host_died(host)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    
+    while 1:
+        line = f.readline()[:-1]
+        if len(line) < 2 or line[1] == ':': break
+        print line
+        sys.stdout.flush()
+    check_stop(host)
+
+stop_now = set()
+def check_stop(host):
+    host_lock.acquire()
+    if host in stop_now:
+        host_lock.release()
+        host_died(host)
+        while not done:
+            time.sleep(1)
+        raise 'done'
+    host_lock.release()
+
+host_locks = {}
+host_queues = {}
+
+def writer(host, fin):
+    while not done:
+        fin.flush()
+        sanity()
+        time.sleep(sleep_times)
+        sanity()
+        while not done:
+            sanity()
+            check_stop(host)
+            sanity()
+            #host_lock.acquire()
+            #try:
+            #    #print host, host_q[host]
+            #    if host_q[host] > queue_size \
+            #       or (host_q[host] > 200 and host_q[host] > mean(host_q.values()) + 200):
+            #        break
+            #finally:
+            #    host_lock.release()
+                
+            sanity()
+            sanity_lock.acquire()
+            try:
+                queue_lock.acquire()
+                try:
+                    try:
+                        item = heapq.heappop(queue)[1]
+                    except IndexError:
+                        break
+                finally:
+                    queue_lock.release()
+                    
+                host_lock.acquire()
+                host_locks[host].acquire()
+                try:
+                    if item in host_queues[host]:
+                        continue
+                    host_queues[host].add(item)
+                finally:
+                    host_locks[host].release()
+                    host_lock.release()
+            finally:
+                sanity_lock.release()
+                sanity()
+            fin.write('%s\n' % item)
+            fin.flush()
+            #print 'Queued', item
+
+            host_lock.acquire()
+            try:
+                host_q[host] += 1
+            finally:
+                host_lock.release()
+            sanity()
+        sanity()
+    fin.close()
+    try:
+        os.waitpid(-1, os.WNOHANG)
+    except OSError:
+        pass
+
+def handle_exception():
+    print 'exception', 
+    traceback.print_exc()
+    sys.stdout.flush()
+    print >>sys.stderr, 'exception',
+    print >>sys.stderr, traceback.format_exc()
+    sys.stderr.flush()
+    while 1:
+        time.sleep(1000)
+    
+def safety_wrapper(func, host, *args):
+    try:
+        func(host, *args)
+    except:
+        print 'exception',
+        traceback.print_exc()
+        print >>sys.stderr, 'exception',
+        print >>sys.stderr, traceback.format_exc()
+        sys.stderr.flush()
+        sys.stdout.flush()
+        try:
+            host_died(host)
+        except:
+            handle_exception()
+        handle_exception()
+
+class Node:
+    def __init__(self, addr):
+        self.addr = addr
+        self.timeout = 0
+        self.neighbors = None
+
+    def __len__(self):
+        return len(self.neighbors)
+
+    def __str__(self):
+        return 'Node(%s)' % self.addr
+
+def synchronized(f):
+    def g(self, *args, **kw):
+        self.lock.acquire()
+        try:
+            return f(self, *args, **kw)
+        finally:
+            self.lock.release()
+    return g
+
+err_log = sys.stderr
+class Walk:
+    pending = {}
+    pending_lock = thread.allocate_lock()
+
+    def __init__(self):
+        self.lock = thread.allocate_lock()
+        self.hops = 0
+        self.stack = []
+        self.random = random.SystemRandom()
+        self.queue(Node('any'))
+
+    @synchronized
+    def _got_timeout(self):
+        #print 'timeout', self.stack[-1]
+        self.stack.pop()
+        if not self.stack:
+            self.remove_self('timeout and empty stack')
+            #self.queue(Node('any'))
+            return True
+        node = self.stack[-1]
+
+        node.timeout += 1
+        if node.timeout > len(node.neighbors):
+            node.timeout = 0
+            self.stack.pop()
+            return self.queue(node)
+        else:
+            return self.queue_neighbor(node)
+
+    def retry(self):
+        while not self._got_timeout():
+            pass
+
+    @synchronized
+    def _got_result(self, addr, neighbors, peer_type):
+        #print 'result:', addr, neighbors
+        node = self.stack[-1]
+        node.finish_time = datetime.datetime.now()
+        node.latency = node.finish_time - node.start_time
+        node.neighbors = [Node(naddr) for naddr in neighbors
+                          if good_addr(naddr) and naddr != addr]
+        node.peer_type = peer_type
+
+        if node.addr == 'any':
+            node.addr = addr
+
+        if not node.neighbors:
+            if len(self.stack) > 1:
+                node.neighbors = [self.stack[-2]]
+            else:
+                self.remove_self('no neighbors and empty stack')
+                return True
+                #node.neighbors = [Node('any')]
+
+        # For the first several hops, do an ordinary random walk to avoid
+        # correlations caused by a low-degree starting node.
+        #if len(self.stack) >= 2:
+        if len(self.stack) >= 5:
+            last = self.stack[-2]
+
+            # Metropolis--Hastings method
+            if not len(node) or \
+               not (len(last) / float(len(node))) > self.random.random():
+                #print 'Staying put'
+                self.stack.pop()
+                node = last
+
+        #print 'Pivot to', node
+
+        self.hops += 1
+        if self.walk_completed(): return True 
+        return self.queue_neighbor(node)            
+
+    def walk_completed(self):
+        if self.hops < hop_budget:
+            return False
+        #print len(self.stack[-1]), self.stack[-1].addr, [(x.addr, as_seconds(x.latency)) for x in self.stack]
+        #print '%s<%s>' % (self.stack[-1].addr, self.stack[-1].peer_type)
+        print self.stack[-1].addr,
+        if show_degree:
+            print len(self.stack[-1].neighbors)
+        else:
+            print
+        sys.stdout.flush()
+        self.remove_self()
+        return True
+
+    def remove_self(self, error=None):
+        if error is not None:
+            print >>err_log, error
+            err_log.flush()
+        all_walks_lock.acquire()
+        all_walks.remove(self)
+        all_walks_lock.release()
+
+    def queue_neighbor(self, node):
+        node = self.random.choice(node.neighbors)
+        return self.queue(node)
+
+    def queue(self, node):
+        self.stack.append(node)
+        node.start_time = datetime.datetime.now()
+        if node.addr in bad_hosts:
+            return False
+        Walk.pending_lock.acquire()
+        try:
+            if node.addr in Walk.pending:
+                Walk.pending[node.addr].append(self)
+            else:
+                Walk.pending[node.addr] = [self]
+                if node.addr != 'any':
+                    queue_lock.acquire()
+                    try:
+                        heapq.heappush(queue, (self.random.random(), node.addr))
+                    finally:
+                        queue_lock.release()
+        finally:
+            Walk.pending_lock.release()
+        return True
+
+    @staticmethod
+    def got_timeout(addr):
+        walks = []
+        Walk.pending_lock.acquire()
+        try:
+            if addr in Walk.pending:
+                walks.extend(Walk.pending[addr])
+                del Walk.pending[addr]
+        finally:
+            Walk.pending_lock.release()
+
+        for walk in walks:
+            if not walk._got_timeout():
+                walk.retry()
+        
+    @staticmethod
+    def got_result(addr, neighbors, peer_type):
+        if not len(neighbors):
+            Walk.got_timeout(addr)
+            return
+        walks = []
+        Walk.pending_lock.acquire()
+        try:
+            if addr in Walk.pending:
+                walks.extend(Walk.pending[addr])
+                del Walk.pending[addr]
+            if 'any' in Walk.pending:
+                walks.extend(Walk.pending['any'])
+                del Walk.pending['any']
+        finally:
+            Walk.pending_lock.release()
+
+        for walk in walks:
+            if not walk._got_result(addr, neighbors, peer_type):
+                walk.retry()
+
+all_walks = set([Walk() for i in range(num_walks)])
+
+def reader_parser(host, line):
+    match = re_line.match(line)
+    if not match:
+        print line
+        sys.stdout.flush()
+        raise
+
+    addr, version, peer_type, neighbors = \
+          [x and x.strip() for x in match.groups()]
+
+    if peer_type not in ('Peer', 'Ultrapeer', 'Leaf'):
+        bad_hosts.add(addr)
+        Walk.got_timeout(addr)
+        return
+
+    if ',' in neighbors:
+        neighbors, leafs = neighbors.split(',')[0:2]
+        # Uncomment this to include all peers, not just ultrapeers
+        #neighbors = neighbors + leafs
+    neighbors = neighbors.split()
+    Walk.got_result(addr, neighbors, peer_type)
+
+def reader(host, fout):
+    global countdown, completions
+    i_stopped = False
+    while not done:
+        sanity()
+        if not i_stopped:
+            check_stop(host)
+        if host_pops[host].poll() is not None:
+            stop(host, fout, 'poll returned None')
+            continue
+        sanity()
+        line = fout.readline()
+        sanity()
+        if not line.strip(): break
+        sanity()
+        if len(line) < 2 or ':' != line[1]:
+            i_stopped = True
+            print host, line.rstrip()
+            sys.stdout.flush()
+            stop(host, fout, 'invalid line %s' % line)
+            continue
+        sanity()
+         
+        if line[0] == 'R':
+            addr = line[3:].split('(')[0]
+            sanity_lock.acquire()
+            host_lock.acquire()
+            host_locks[host].acquire()
+            try:
+                host_queues[host].remove(addr)
+            finally:
+                host_locks[host].release()
+                host_lock.release()
+            reader_parser(host, line[3:])
+            sanity_lock.release()
+            sanity()
+            output_lock.acquire()
+            try:
+                completions += 1
+            finally:
+                output_lock.release()
+            continue
+        sanity()
+        line = line[:-1]
+        if line[0] == 'S':
+            print >>sys.stderr, '%30s' % host, line[3:]
+            sys.stdout.flush()
+            pass
+        elif line[0] == 'M':
+            pass
+        elif line[0] == 'Q':
+            queue_lock.acquire()
+            try:
+                qlen = len(queue)
+            finally:
+                queue_lock.release()
+
+            host_lock.acquire()
+            try:
+                host_q[host], host_a[host] = [int(x) for x in line[3:].split()]
+                #print host, host_q[host]
+                #if sum(host_q.values()) > 0 or qlen > 0:
+                #    countdown = -1
+                #elif countdown < 0:
+                #    countdown = 30
+            finally:
+                host_lock.release()
+        elif line[0] == 'E':
+            raise 'Obsolete'
+        else:
+            i_stopped = True
+            stop(host, fout, 'invalid line2 %s' % line)
+            print host, line.rstrip()
+            sys.stdout.flush()
+
+    if i_stopped: return
+    fout.close()
+    try:
+        os.kill(pids[host], signal.SIGTERM)
+    except OSError:
+        pass
+    try:
+        os.waitpid(-1, os.WNOHANG)
+    except OSError:
+        pass
+
+pids = {}
+def launch(host):
+    pop = Popen(['nice', 'bash', '-c',
+                 'cd %s; ulimit -n hard; %s %s'
+                 % (os.path.dirname(path), path, args)],
+                stdin = PIPE, stdout=PIPE, stderr=STDOUT)
+    fin = pop.stdin
+    fout = pop.stdout
+    while host in pids:
+        host = host + '1'
+    host_pops[host] = pop
+    pids[host] = pop.pid
+    host_lock.acquire()
+    try:
+        host_q[host] = 0
+        host_a[host] = 0
+        host_locks[host] = thread.allocate_lock()
+        host_queues[host] = set()
+        thread.start_new_thread(safety_wrapper, (writer, host, fin))
+        thread.start_new_thread(safety_wrapper, (reader, host, fout))
+    finally:
+        host_lock.release()
+
+bootstrap_data = [line.strip() for line in open(bootstrap, 'r').readlines()]
+def need_more_bootstrapping():
+    queue_lock.acquire()
+    try:
+        for addr in random.sample(bootstrap_data, 100):
+            heapq.heappush(queue, (random.random(), addr))
+    finally:
+        queue_lock.release()
+
+need_more_bootstrapping()
+
+[launch(h) for h in hosts] 
+
+start_time = datetime.datetime.now()
+
+def do_print():
+    all_walks_lock.acquire()
+    num_walks = len(all_walks)
+    all_walks_lock.release()
+    Walk.pending_lock.acquire()
+    any_len = len(Walk.pending.get('any', []))
+    Walk.pending_lock.release()
+    queue_lock.acquire()
+    host_lock.acquire()
+    try:
+        #print >>sys.stderr, 'Live: %d/%d, Queue: %d, Total Queued: %d, Active: %d, Completions: %d, Speed: %d' % (len(hosts)-len(stop_now), len(hosts), len(queue), len(queue) + sum(host_q.values()), sum(host_a.values()), completions, completions / delta), num_walks, any_len
+        #sys.stdout.flush()
+        pass
+
+    finally:
+        host_lock.release()
+        queue_lock.release()
+    sys.stdout.flush()
+
+
+try:
+    while not done:
+        #print end, datetime.datetime.now()
+        sanity()
+        time.sleep(1)
+        sanity()
+        now = datetime.datetime.now()
+        delta = now - start_time
+        delta = max(1,delta.days * 24*60 + delta.seconds/60.0)
+        output_lock.acquire()
+        try:
+            speed = completions / delta
+        finally:
+            output_lock.release()
+        do_print()
+        
+        sanity()
+        host_lock.acquire()
+        if not sum(host_q.values()) and not sum(host_a.values()):
+            Walk.pending_lock.acquire()
+            if Walk.pending.get('any', False):
+                need_more_bootstrapping()
+            Walk.pending_lock.release()
+        host_lock.release()
+        if countdown > 0:
+            countdown -= 1
+            #print 'Countdown', countdown
+        #if countdown == 0 or end <= datetime.datetime.now() \
+        #   or sum(host_q.values()) + sum(host_a.values()) + len(queue) == 0:
+        #    done = True
+        all_walks_lock.acquire()
+        done = not all_walks
+        all_walks_lock.release()
+        sanity()
+except KeyboardInterrupt:
+    pass
+
+do_print()
+done = True
+
+time.sleep(10)
+
