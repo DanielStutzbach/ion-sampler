@@ -1,17 +1,17 @@
-Copyright (C) 2006 Daniel Stutzbach
+Copyright (C) 2006--2009 Daniel Stutzbach
 
-README for ion-sampler 1.0
+README for ion-sampler 1.0.1
 
 ion-sampler is a tool for selecting peers approximately uniformly at
 random from the active peers in a peer-to-peer network.  The tool's
 algorithm is described in detail in the paper:
 
     Daniel Stutzbach, Reza Rejaie, Nick Duffield, Subhabrata Sen,
-    Walter Willinger, ``On Unbiased Sampling for Unstructured
-    Peer-to-Peer Networks'', Internet Measurement Conference, October,
-    2006.
+    Walter Willinger, ``On unbiased sampling for unstructured
+    peer-to-peer networks'', IEEE/ACM Trans. Netw., vol. 17, iss. 2,
+    pp. 377-390, 2009.
 
-    http://www.barsoom.org/~agthorr/papers/imc-2006-sampling.pdf
+    http://www.barsoom.org/papers/ton-2007-sampling.pdf
 
 Reading the paper before using the tool is highly recommended.
 
@@ -23,15 +23,25 @@ it is likely these hooks will be removed.  Use with care.
 
 Requirements:
 
-1. A recent version of gcc
-2. GNU make
-3. A real-time library (librt) with the clock_gettime() and
+1. An initial list of ultrapeers
+2. gcc
+3. GNU make
+4. A real-time library (librt) with the clock_gettime() and
    clock_getres() functions.
-4. Python 2.4
+5. Python 2.4, 2.5, or 2.6
 
-Tested on Red Hat Linux.  Porting to other Linux systems should be a
-piece of cake.  Porting to non-Linux systems shouldn't be too hard
-either, as long as they have gcc and Python.
+Place the list of ultrapeers in the "gnutella.in" file.  The
+ion-sampler distribution comes with a list of around 1,000 ultrapeers
+that were up in October 2009.  If ion-sampler takes a long time before
+printing any output when run, probably none of the ultrapeers are
+still online and it is diligently trying all of them.  In that case,
+you will need to acquire a new list.  It's not important that all of
+the ultrapeers listed in gnutella.in are online, as long as a decent
+percentage of them are.
+
+Tested on Red Hat Debian and Linux.  Porting to other Linux systems
+should be a piece of cake.  Porting to non-Linux systems shouldn't be
+too hard either, as long as they have gcc and Python.
 
 The use of the real-time library is to avoid problems with clocks
 running backwards.  Ordinary time-related system calls simply return
@@ -116,4 +126,4 @@ address.
 ------------------------------------------------------------------------
 
 Please send all questions, comments, or patches to:
-    "Daniel Stutzbach" <agthorr@barsoom.org>
+    "Daniel Stutzbach" <daniel@stutzbachenterprises.com>
